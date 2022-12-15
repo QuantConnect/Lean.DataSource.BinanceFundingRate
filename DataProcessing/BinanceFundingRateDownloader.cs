@@ -53,7 +53,7 @@ namespace QuantConnect.DataProcessing
             _existingInDataFolder = Path.Combine(Globals.DataFolder, "cryptofuture", "binance", "margin_interest");
 
             // Represents rate limits of X requests per Y second
-            _indexGate = new RateGate(50, TimeSpan.FromSeconds(1));
+            _indexGate = new RateGate(25, TimeSpan.FromSeconds(1));
 
             Directory.CreateDirectory(_destinationFolder);
 
@@ -117,7 +117,15 @@ namespace QuantConnect.DataProcessing
                 // symbol not mandatory
                 var data = Extensions.DownloadData($"{baseApi}/fundingRate?startTime={start}&endTime={end}");
 
-                return JsonConvert.DeserializeObject<ApiFundingRate[]>(data);
+                try
+                {
+                    return JsonConvert.DeserializeObject<ApiFundingRate[]>(data);
+                }
+                catch (Exception)
+                {
+                    Logging.Log.Error($"GetData(): deserialization failed {data}");
+                    throw;
+                }
             }
             else
             {
@@ -136,7 +144,15 @@ namespace QuantConnect.DataProcessing
 
                     lock (result)
                     {
-                        result.AddRange(JsonConvert.DeserializeObject<ApiFundingRate[]>(data));
+                        try
+                        {
+                            result.AddRange(JsonConvert.DeserializeObject<ApiFundingRate[]>(data));
+                        }
+                        catch (Exception)
+                        {
+                            Logging.Log.Error($"GetData(): deserialization failed {data}");
+                            throw;
+                        }
                     }
                 });
                 return result;
