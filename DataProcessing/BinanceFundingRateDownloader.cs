@@ -79,7 +79,8 @@ namespace QuantConnect.DataProcessing
                             ratePerSymbol[apiFundingRate.Symbol] = dictionary = new();
                         }
 
-                        dictionary[fundingTime] = apiFundingRate.FundingRate;
+                        var key = new DateTime(fundingTime.Year, fundingTime.Month, fundingTime.Day, fundingTime.Hour, fundingTime.Minute, fundingTime.Second);
+                        dictionary[key] = apiFundingRate.FundingRate;
                     }
                 }
 
