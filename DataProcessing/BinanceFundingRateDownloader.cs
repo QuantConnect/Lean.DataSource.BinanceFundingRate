@@ -15,10 +15,13 @@
 
 using System;
 using System.IO;
+using System.Net;
 using System.Linq;
+using System.Net.Http;
 using Newtonsoft.Json;
 using QuantConnect.Util;
 using System.Threading;
+using QuantConnect.Logging;
 using System.Globalization;
 using System.Threading.Tasks;
 using System.Collections.Generic;
@@ -31,8 +34,7 @@ namespace QuantConnect.DataProcessing
     /// </summary>
     public class BinanceFundingRateDownloader : IDisposable
     {
-        private const string _binanceFutureCryptoApiEndpoint = "https://fapi.binance.com/fapi/v1";
-        private const string _binanceFutureCoinApiEndpoint = "https://dapi.binance.com/dapi/v1";
+        private static readonly string[] _apiEndpoints = [ "https://dapi.binance.com/dapi/v1", "https://fapi.binance.com/fapi/v1" ];
 
         /// <summary>
         /// Records per fundingRate response. Binance defaults this to 100 and truncates silently,
@@ -41,7 +43,7 @@ namespace QuantConnect.DataProcessing
         private const int _fundingRatePageSize = 1000;
 
         /// <summary>
-        /// Kept well below the rate gate: <see cref="Extensions.DownloadData"/> blocks its thread,
+        /// Kept well below the rate gate: the download helper blocks its thread on the response,
         /// so an unbounded fan out over hundreds of symbols starves the thread pool and the
         /// in flight requests time out waiting for a thread to resume on.
         /// </summary>
@@ -49,12 +51,16 @@ namespace QuantConnect.DataProcessing
 
         private const int _maxDownloadAttempts = 3;
 
-        private static readonly string[] _apiEndpoints = [_binanceFutureCoinApiEndpoint, _binanceFutureCryptoApiEndpoint];
+        /// <summary>
+        /// Binance answers 429 once the IP exceeds its budget and 418 while it bans the IP, which
+        /// lasts minutes; a back off of a few seconds would only burn the attempts inside the ban.
+        /// </summary>
+        private static readonly TimeSpan _rateLimitBackOff = TimeSpan.FromMinutes(1);
 
         private readonly DateTime? _deploymentDate;
         private readonly string _destinationFolder;
         private readonly string _existingInDataFolder;
-        private readonly Dictionary<string, string[]> _perpetualSymbolsPerApi;
+        private readonly HttpClient _client = new();
 
         /// <summary>
         /// Control the rate of download per unit of time.
@@ -75,8 +81,6 @@ namespace QuantConnect.DataProcessing
             _indexGate = new RateGate(25, TimeSpan.FromSeconds(1));
 
             Directory.CreateDirectory(_destinationFolder);
-
-            _perpetualSymbolsPerApi = _apiEndpoints.ToDictionary(baseApi => baseApi, GetPerpetualSymbols);
         }
 
         /// <summary>
@@ -90,29 +94,51 @@ namespace QuantConnect.DataProcessing
 
             foreach (var baseApi in _apiEndpoints)
             {
-                var symbols = _perpetualSymbolsPerApi[baseApi];
-                var ratePerSymbol = new ConcurrentDictionary<string, Dictionary<DateTime, decimal>>();
-                var options = new ParallelOptions { MaxDegreeOfParallelism = _maxParallelDownloads };
-
-                Parallel.ForEach(symbols, options, symbol =>
+                var symbols = GetPerpetualSymbols(baseApi);
+                if (symbols == null)
                 {
-                    var rates = GetData(baseApi, symbol, start, end);
-                    if (rates.Count > 0)
-                    {
-                        ratePerSymbol[symbol] = rates;
-                    }
-                    // an empty result is expected for a contract listed after the window we process
-                });
-
-                if (ratePerSymbol.IsEmpty)
-                {
-                    Logging.Log.Error($"Run(): {baseApi} returned no funding rate for any of its {symbols.Length} perpetuals between {start:yyyyMMdd} and {end:yyyyMMdd}");
                     success = false;
                     continue;
                 }
 
-                Logging.Log.Trace($"Run(): {baseApi} returned funding rates for {ratePerSymbol.Count} of {symbols.Length} perpetuals");
+                var ratePerSymbol = new ConcurrentDictionary<string, Dictionary<DateTime, decimal>>();
+                var failed = new ConcurrentBag<string>();
+                var options = new ParallelOptions { MaxDegreeOfParallelism = _maxParallelDownloads };
 
+                Parallel.ForEach(symbols, options, symbol =>
+                {
+                    var rates = GetData(baseApi, symbol.Name, start, end);
+                    if (rates == null)
+                    {
+                        failed.Add(symbol.Name);
+                    }
+                    else if (rates.Count > 0)
+                    {
+                        ratePerSymbol[symbol.Name] = rates;
+                    }
+                });
+
+                // a contract trading since before the window settles at least every 8 hours, so it
+                // must have produced rows. Anything else is listed later or no longer trading
+                var missing = symbols
+                    .Where(x => x.IsTrading && x.OnboardTime < start && !ratePerSymbol.ContainsKey(x.Name) && !failed.Contains(x.Name))
+                    .Select(x => x.Name)
+                    .ToList();
+
+                if (!failed.IsEmpty)
+                {
+                    Log.Error($"Run(): {baseApi} download failed for {failed.Count} perpetuals: {string.Join(", ", failed)}");
+                    success = false;
+                }
+                if (missing.Count > 0)
+                {
+                    Log.Error($"Run(): {baseApi} returned no funding rate for {missing.Count} trading perpetuals: {string.Join(", ", missing)}");
+                    success = false;
+                }
+
+                Log.Trace($"Run(): {baseApi} returned funding rates for {ratePerSymbol.Count} of {symbols.Length} perpetuals between {start:yyyyMMdd} and {end:yyyyMMdd}");
+
+                // what did download is still good data, so it is written even when the run fails
                 foreach (var kvp in ratePerSymbol)
                 {
                     SaveContentToFile(_destinationFolder, kvp.Key.RemoveFromEnd("_PERP"), kvp.Value);
@@ -126,13 +152,12 @@ namespace QuantConnect.DataProcessing
         /// The perpetual contracts an endpoint settles funding for. The USDT endpoint also lists
         /// tokenized equities as TRADIFI_PERPETUAL, which pay funding as well.
         /// </summary>
-        private static string[] GetPerpetualSymbols(string baseApi)
+        private ApiSymbol[] GetPerpetualSymbols(string baseApi)
         {
-            var exchangeInfo = JsonConvert.DeserializeObject<ExchangeInfo>(Extensions.DownloadData($"{baseApi}/exchangeInfo"));
+            var exchangeInfo = Download<ExchangeInfo>($"{baseApi}/exchangeInfo");
 
-            return exchangeInfo.Symbols
+            return exchangeInfo?.Symbols?
                 .Where(x => x.ContractType != null && x.ContractType.EndsWith("PERPETUAL", StringComparison.InvariantCultureIgnoreCase))
-                .Select(x => x.Name)
                 .ToArray();
         }
 
@@ -147,6 +172,10 @@ namespace QuantConnect.DataProcessing
             return (new DateTime(2019, 9, 13), DateTime.UtcNow.Date.AddDays(1));
         }
 
+        /// <summary>
+        /// Pages through the funding rates of a symbol. Returns null when a page could not be
+        /// downloaded, so the caller does not mistake a lost symbol for one without funding.
+        /// </summary>
         private Dictionary<DateTime, decimal> GetData(string baseApi, string symbol, DateTime start, DateTime end)
         {
             var result = new Dictionary<DateTime, decimal>();
@@ -155,17 +184,17 @@ namespace QuantConnect.DataProcessing
 
             while (from < to)
             {
-                var page = DownloadPage(symbol, $"{baseApi}/fundingRate?symbol={symbol}&startTime={from}&endTime={to}&limit={_fundingRatePageSize}");
-                if (page is null or { Length: 0 })
+                var page = Download<ApiFundingRate[]>($"{baseApi}/fundingRate?symbol={symbol}&startTime={from}&endTime={to}&limit={_fundingRatePageSize}");
+                if (page == null)
                 {
-                    break;
+                    return null;
                 }
 
                 foreach (var apiFundingRate in page)
                 {
-                    var fundingTime = Time.UnixMillisecondTimeStampToDateTime(apiFundingRate.FundingTime);
-                    var key = new DateTime(fundingTime.Year, fundingTime.Month, fundingTime.Day, fundingTime.Hour, fundingTime.Minute, fundingTime.Second);
-                    result[key] = apiFundingRate.FundingRate;
+                    // funding times carry a few milliseconds of jitter
+                    var fundingTime = Time.UnixMillisecondTimeStampToDateTime(apiFundingRate.FundingTime).RoundDown(Time.OneSecond);
+                    result[fundingTime] = apiFundingRate.FundingRate;
                 }
 
                 if (page.Length < _fundingRatePageSize)
@@ -182,35 +211,46 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Downloads a single page of funding rates, retrying the transient failures Binance throws
-        /// at us over a few hundred requests instead of losing the whole run to one of them.
+        /// Downloads and deserializes a url, retrying the transient failures Binance throws at us
+        /// over a few hundred requests. Returns null once the attempts are spent or the failure
+        /// is permanent, so the caller decides what one lost request costs.
         /// </summary>
-        private ApiFundingRate[] DownloadPage(string symbol, string url)
+        private T Download<T>(string url) where T : class
         {
             for (var attempt = 1; attempt <= _maxDownloadAttempts; attempt++)
             {
                 _indexGate.WaitToProceed();
 
+                HttpStatusCode? statusCode = null;
                 try
                 {
-                    // returns null on a non success status code
-                    var data = Extensions.DownloadData(url);
-                    if (data != null)
+                    // logs and returns false on a non success status code or connection error
+                    if (_client.TryDownloadData<T>(url, out var result, out statusCode))
                     {
-                        return JsonConvert.DeserializeObject<ApiFundingRate[]>(data);
+                        return result;
                     }
-
-                    Logging.Log.Trace($"DownloadPage(): {symbol} attempt {attempt} returned no data");
                 }
                 catch (Exception exception)
                 {
-                    Logging.Log.Trace($"DownloadPage(): {symbol} attempt {attempt} failed: {exception.Message}");
+                    // timeouts and malformed bodies escape the helper
+                    Log.Error($"Download(): attempt {attempt} failed for {url}: {exception.Message}");
                 }
 
-                Thread.Sleep(TimeSpan.FromSeconds(attempt));
+                var rateLimited = statusCode is HttpStatusCode.TooManyRequests or (HttpStatusCode)418;
+                if (!rateLimited && statusCode is >= HttpStatusCode.BadRequest and < HttpStatusCode.InternalServerError)
+                {
+                    // Binance will keep rejecting the same request
+                    break;
+                }
+
+                if (attempt < _maxDownloadAttempts)
+                {
+                    Thread.Sleep(rateLimited ? _rateLimitBackOff : TimeSpan.FromSeconds(attempt));
+                }
             }
 
-            throw new Exception($"DownloadPage(): giving up on {symbol} after {_maxDownloadAttempts} attempts: {url}");
+            Log.Error($"Download(): giving up on {url}");
+            return null;
         }
 
         /// <summary>
@@ -261,12 +301,12 @@ namespace QuantConnect.DataProcessing
         /// </summary>
         public void Dispose()
         {
+            _client.Dispose();
             _indexGate?.Dispose();
         }
 
         private class ApiFundingRate
         {
-            public string Symbol { get; set; }
             public long FundingTime { get; set; }
             public decimal FundingRate { get; set; }
         }
@@ -281,6 +321,14 @@ namespace QuantConnect.DataProcessing
             [JsonProperty(PropertyName = "symbol")]
             public string Name { get; set; }
             public string ContractType { get; set; }
+            public long OnboardDate { get; set; }
+
+            // the USDT endpoint calls it status, the coin endpoint contractStatus
+            public string Status { get; set; }
+            public string ContractStatus { get; set; }
+
+            public bool IsTrading => (Status ?? ContractStatus) == "TRADING";
+            public DateTime OnboardTime => Time.UnixMillisecondTimeStampToDateTime(OnboardDate);
         }
     }
 }
