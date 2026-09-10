@@ -34,7 +34,10 @@ namespace QuantConnect.DataProcessing
     /// </summary>
     public class BinanceFundingRateDownloader : IDisposable
     {
-        private static readonly string[] _apiEndpoints = [ "https://dapi.binance.com/dapi/v1", "https://fapi.binance.com/fapi/v1" ];
+        private const string _binanceFutureCryptoApiEndpoint = "https://fapi.binance.com/fapi/v1";
+        private const string _binanceFutureCoinApiEndpoint = "https://dapi.binance.com/dapi/v1";
+
+        private static readonly string[] _apiEndpoints = [ _binanceFutureCoinApiEndpoint, _binanceFutureCryptoApiEndpoint ];
 
         /// <summary>
         /// Records per fundingRate response. Binance defaults this to 100 and truncates silently,
@@ -110,7 +113,12 @@ namespace QuantConnect.DataProcessing
                     var rates = GetData(baseApi, symbol.Name, start, end);
                     if (rates == null)
                     {
-                        failed.Add(symbol.Name);
+                        // a symbol the exchange no longer lists may be rejected outright, and the file
+                        // we already hold is left untouched either way, so it must not fail the run
+                        if (!symbol.Delisted)
+                        {
+                            failed.Add(symbol.Name);
+                        }
                     }
                     else if (rates.Count > 0)
                     {
@@ -136,7 +144,9 @@ namespace QuantConnect.DataProcessing
                     success = false;
                 }
 
-                Log.Trace($"Run(): {baseApi} returned funding rates for {ratePerSymbol.Count} of {symbols.Length} perpetuals between {start:yyyyMMdd} and {end:yyyyMMdd}");
+                var recovered = symbols.Count(x => x.Delisted && ratePerSymbol.ContainsKey(x.Name));
+                Log.Trace($"Run(): {baseApi} returned funding rates for {ratePerSymbol.Count - recovered} of " +
+                    $"{symbols.Count(x => !x.Delisted)} perpetuals and {recovered} delisted between {start:yyyyMMdd} and {end:yyyyMMdd}");
 
                 // what did download is still good data, so it is written even when the run fails
                 foreach (var kvp in ratePerSymbol)
@@ -155,10 +165,42 @@ namespace QuantConnect.DataProcessing
         private ApiSymbol[] GetPerpetualSymbols(string baseApi)
         {
             var exchangeInfo = Download<ExchangeInfo>($"{baseApi}/exchangeInfo");
+            if (exchangeInfo?.Symbols == null)
+            {
+                return null;
+            }
 
-            return exchangeInfo?.Symbols?
+            var listed = exchangeInfo.Symbols
                 .Where(x => x.ContractType != null && x.ContractType.EndsWith("PERPETUAL", StringComparison.InvariantCultureIgnoreCase))
-                .ToArray();
+                .ToList();
+
+            return [.. listed, .. GetDelistedSymbols(baseApi, listed)];
+        }
+
+        /// <summary>
+        /// Binance drops a delisted contract from exchangeInfo but keeps serving its funding history,
+        /// so a ticker we already store and can no longer see is still worth asking for; without this
+        /// a full rebuild loses its file. Which endpoint settled it is not recorded anywhere, so both
+        /// are asked: the one that does not know the symbol answers with an empty page.
+        /// </summary>
+        private IEnumerable<ApiSymbol> GetDelistedSymbols(string baseApi, IEnumerable<ApiSymbol> listed)
+        {
+            if (!Directory.Exists(_existingInDataFolder))
+            {
+                return [];
+            }
+
+            var known = listed
+                .Select(x => x.Name.RemoveFromEnd("_PERP"))
+                .ToHashSet(StringComparer.InvariantCultureIgnoreCase);
+
+            // coin margined contracts are named <TICKER>_PERP, the file keeps the ticker
+            var suffix = baseApi == _binanceFutureCoinApiEndpoint ? "_PERP" : string.Empty;
+
+            return Directory.EnumerateFiles(_existingInDataFolder, "*.csv")
+                .Select(x => Path.GetFileNameWithoutExtension(x).ToUpperInvariant())
+                .Where(x => !known.Contains(x))
+                .Select(x => new ApiSymbol { Name = $"{x}{suffix}", Delisted = true });
         }
 
         private (DateTime Start, DateTime End) GetProcessingWindow()
@@ -326,6 +368,12 @@ namespace QuantConnect.DataProcessing
             // the USDT endpoint calls it status, the coin endpoint contractStatus
             public string Status { get; set; }
             public string ContractStatus { get; set; }
+
+            /// <summary>
+            /// Set for a symbol exchangeInfo no longer lists, recovered from the data we already hold
+            /// </summary>
+            [JsonIgnore]
+            public bool Delisted { get; set; }
 
             public bool IsTrading => (Status ?? ContractStatus) == "TRADING";
             public DateTime OnboardTime => Time.UnixMillisecondTimeStampToDateTime(OnboardDate);
