@@ -333,7 +333,9 @@ namespace QuantConnect.DataProcessing
             var finalLines = contents.OrderBy(x => x.Key).Select(x => $"{x.Key:yyyyMMdd HH:mm:ss},{x.Value.ToStringInvariant()}").ToList();
 
             var tempPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.tmp");
-            File.WriteAllLines(tempPath, finalLines);
+            // the fleet writes these on linux and the store keeps unix line endings, so a run on
+            // windows must not turn them into CRLF
+            File.WriteAllText(tempPath, string.Join("\n", finalLines) + "\n");
             var tempFilePath = new FileInfo(tempPath);
             tempFilePath.MoveTo(finalPath, true);
         }
