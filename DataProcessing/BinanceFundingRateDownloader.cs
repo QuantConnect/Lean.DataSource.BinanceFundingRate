@@ -18,9 +18,11 @@ using System.IO;
 using System.Linq;
 using Newtonsoft.Json;
 using QuantConnect.Util;
+using System.Threading;
 using System.Globalization;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 
 namespace QuantConnect.DataProcessing
 {
@@ -32,10 +34,27 @@ namespace QuantConnect.DataProcessing
         private const string _binanceFutureCryptoApiEndpoint = "https://fapi.binance.com/fapi/v1";
         private const string _binanceFutureCoinApiEndpoint = "https://dapi.binance.com/dapi/v1";
 
+        /// <summary>
+        /// Records per fundingRate response. Binance defaults this to 100 and truncates silently,
+        /// which drops most symbols on any query wide enough to cover the whole exchange.
+        /// </summary>
+        private const int _fundingRatePageSize = 1000;
+
+        /// <summary>
+        /// Kept well below the rate gate: <see cref="Extensions.DownloadData"/> blocks its thread,
+        /// so an unbounded fan out over hundreds of symbols starves the thread pool and the
+        /// in flight requests time out waiting for a thread to resume on.
+        /// </summary>
+        private const int _maxParallelDownloads = 8;
+
+        private const int _maxDownloadAttempts = 3;
+
+        private static readonly string[] _apiEndpoints = [_binanceFutureCoinApiEndpoint, _binanceFutureCryptoApiEndpoint];
+
         private readonly DateTime? _deploymentDate;
         private readonly string _destinationFolder;
         private readonly string _existingInDataFolder;
-        private readonly ExchangeInfo _exchangeInfo;
+        private readonly Dictionary<string, string[]> _perpetualSymbolsPerApi;
 
         /// <summary>
         /// Control the rate of download per unit of time.
@@ -57,7 +76,7 @@ namespace QuantConnect.DataProcessing
 
             Directory.CreateDirectory(_destinationFolder);
 
-            _exchangeInfo = JsonConvert.DeserializeObject<ExchangeInfo>(Extensions.DownloadData($"{_binanceFutureCoinApiEndpoint}/exchangeInfo"));
+            _perpetualSymbolsPerApi = _apiEndpoints.ToDictionary(baseApi => baseApi, GetPerpetualSymbols);
         }
 
         /// <summary>
@@ -66,23 +85,33 @@ namespace QuantConnect.DataProcessing
         /// <returns>True if process all downloads successfully</returns>
         public bool Run()
         {
-            foreach (var baseApi in new[] { _binanceFutureCoinApiEndpoint, _binanceFutureCryptoApiEndpoint })
-            {
-                var ratePerSymbol = new Dictionary<string, Dictionary<DateTime, decimal>>();
-                foreach (var date in GetProcessingDates())
-                {
-                    foreach (var apiFundingRate in GetData(baseApi, date))
-                    {
-                        var fundingTime = Time.UnixMillisecondTimeStampToDateTime(apiFundingRate.FundingTime);
-                        if (!ratePerSymbol.TryGetValue(apiFundingRate.Symbol, out var dictionary))
-                        {
-                            ratePerSymbol[apiFundingRate.Symbol] = dictionary = new();
-                        }
+            var success = true;
+            var (start, end) = GetProcessingWindow();
 
-                        var key = new DateTime(fundingTime.Year, fundingTime.Month, fundingTime.Day, fundingTime.Hour, fundingTime.Minute, fundingTime.Second);
-                        dictionary[key] = apiFundingRate.FundingRate;
+            foreach (var baseApi in _apiEndpoints)
+            {
+                var symbols = _perpetualSymbolsPerApi[baseApi];
+                var ratePerSymbol = new ConcurrentDictionary<string, Dictionary<DateTime, decimal>>();
+                var options = new ParallelOptions { MaxDegreeOfParallelism = _maxParallelDownloads };
+
+                Parallel.ForEach(symbols, options, symbol =>
+                {
+                    var rates = GetData(baseApi, symbol, start, end);
+                    if (rates.Count > 0)
+                    {
+                        ratePerSymbol[symbol] = rates;
                     }
+                    // an empty result is expected for a contract listed after the window we process
+                });
+
+                if (ratePerSymbol.IsEmpty)
+                {
+                    Logging.Log.Error($"Run(): {baseApi} returned no funding rate for any of its {symbols.Length} perpetuals between {start:yyyyMMdd} and {end:yyyyMMdd}");
+                    success = false;
+                    continue;
                 }
+
+                Logging.Log.Trace($"Run(): {baseApi} returned funding rates for {ratePerSymbol.Count} of {symbols.Length} perpetuals");
 
                 foreach (var kvp in ratePerSymbol)
                 {
@@ -90,74 +119,98 @@ namespace QuantConnect.DataProcessing
                 }
             }
 
-            return true;
+            return success;
         }
 
-        private IEnumerable<DateTime> GetProcessingDates()
+        /// <summary>
+        /// The perpetual contracts an endpoint settles funding for. The USDT endpoint also lists
+        /// tokenized equities as TRADIFI_PERPETUAL, which pay funding as well.
+        /// </summary>
+        private static string[] GetPerpetualSymbols(string baseApi)
+        {
+            var exchangeInfo = JsonConvert.DeserializeObject<ExchangeInfo>(Extensions.DownloadData($"{baseApi}/exchangeInfo"));
+
+            return exchangeInfo.Symbols
+                .Where(x => x.ContractType != null && x.ContractType.EndsWith("PERPETUAL", StringComparison.InvariantCultureIgnoreCase))
+                .Select(x => x.Name)
+                .ToArray();
+        }
+
+        private (DateTime Start, DateTime End) GetProcessingWindow()
         {
             if (_deploymentDate.HasValue)
             {
-                return new[] { _deploymentDate.Value };
+                return (_deploymentDate.Value.Date, _deploymentDate.Value.Date.AddDays(1));
             }
-            else
-            {
-                // everything
-                return Time.EachDay(new DateTime(2019, 9, 13), DateTime.UtcNow.Date);
-            }
+
+            // everything
+            return (new DateTime(2019, 9, 13), DateTime.UtcNow.Date.AddDays(1));
         }
 
-        private IEnumerable<ApiFundingRate> GetData(string baseApi, DateTime date)
+        private Dictionary<DateTime, decimal> GetData(string baseApi, string symbol, DateTime start, DateTime end)
         {
-            var start = (long)Time.DateTimeToUnixTimeStampMilliseconds(date.Date);
-            var end = (long)Time.DateTimeToUnixTimeStampMilliseconds(date.AddDays(1).Date);
+            var result = new Dictionary<DateTime, decimal>();
+            var from = (long)Time.DateTimeToUnixTimeStampMilliseconds(start);
+            var to = (long)Time.DateTimeToUnixTimeStampMilliseconds(end);
 
-            if (baseApi == _binanceFutureCryptoApiEndpoint)
+            while (from < to)
+            {
+                var page = DownloadPage(symbol, $"{baseApi}/fundingRate?symbol={symbol}&startTime={from}&endTime={to}&limit={_fundingRatePageSize}");
+                if (page is null or { Length: 0 })
+                {
+                    break;
+                }
+
+                foreach (var apiFundingRate in page)
+                {
+                    var fundingTime = Time.UnixMillisecondTimeStampToDateTime(apiFundingRate.FundingTime);
+                    var key = new DateTime(fundingTime.Year, fundingTime.Month, fundingTime.Day, fundingTime.Hour, fundingTime.Minute, fundingTime.Second);
+                    result[key] = apiFundingRate.FundingRate;
+                }
+
+                if (page.Length < _fundingRatePageSize)
+                {
+                    break;
+                }
+
+                // a symbol settles at most once per funding time, so resuming right after the last
+                // one we saw can neither skip nor repeat a record
+                from = page.Max(x => x.FundingTime) + 1;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Downloads a single page of funding rates, retrying the transient failures Binance throws
+        /// at us over a few hundred requests instead of losing the whole run to one of them.
+        /// </summary>
+        private ApiFundingRate[] DownloadPage(string symbol, string url)
+        {
+            for (var attempt = 1; attempt <= _maxDownloadAttempts; attempt++)
             {
                 _indexGate.WaitToProceed();
 
-                // symbol not mandatory
-                var data = Extensions.DownloadData($"{baseApi}/fundingRate?startTime={start}&endTime={end}");
-
                 try
                 {
-                    return JsonConvert.DeserializeObject<ApiFundingRate[]>(data);
-                }
-                catch (Exception)
-                {
-                    Logging.Log.Error($"GetData(): deserialization failed {data}");
-                    throw;
-                }
-            }
-            else
-            {
-                var result = new List<ApiFundingRate>();
-
-                if(date < new DateTime(2020, 10, 1))
-                {
-                    // nothing before this date
-                    return result;
-                }
-                Parallel.ForEach(_exchangeInfo.Symbols.Where(x => x.ContractType.Equals("PERPETUAL", StringComparison.InvariantCultureIgnoreCase)), symbol =>
-                {
-                    _indexGate.WaitToProceed();
-
-                    var data = Extensions.DownloadData($"{baseApi}/fundingRate?startTime={start}&endTime={end}&symbol={symbol.Name}");
-
-                    lock (result)
+                    // returns null on a non success status code
+                    var data = Extensions.DownloadData(url);
+                    if (data != null)
                     {
-                        try
-                        {
-                            result.AddRange(JsonConvert.DeserializeObject<ApiFundingRate[]>(data));
-                        }
-                        catch (Exception)
-                        {
-                            Logging.Log.Error($"GetData(): deserialization failed {data}");
-                            throw;
-                        }
+                        return JsonConvert.DeserializeObject<ApiFundingRate[]>(data);
                     }
-                });
-                return result;
+
+                    Logging.Log.Trace($"DownloadPage(): {symbol} attempt {attempt} returned no data");
+                }
+                catch (Exception exception)
+                {
+                    Logging.Log.Trace($"DownloadPage(): {symbol} attempt {attempt} failed: {exception.Message}");
+                }
+
+                Thread.Sleep(TimeSpan.FromSeconds(attempt));
             }
+
+            throw new Exception($"DownloadPage(): giving up on {symbol} after {_maxDownloadAttempts} attempts: {url}");
         }
 
         /// <summary>
