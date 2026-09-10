@@ -236,7 +236,11 @@ namespace QuantConnect.DataProcessing
                 {
                     // funding times carry a few milliseconds of jitter
                     var fundingTime = Time.UnixMillisecondTimeStampToDateTime(apiFundingRate.FundingTime).RoundDown(Time.OneSecond);
-                    result[fundingTime] = apiFundingRate.FundingRate;
+
+                    // the stock perps settle a second rate a few milliseconds after the first one and
+                    // it rounds to the same second. The endpoint returns them in ascending funding
+                    // time and the published history keeps the earlier, so the first one wins
+                    result.TryAdd(fundingTime, apiFundingRate.FundingRate);
                 }
 
                 if (page.Length < _fundingRatePageSize)
